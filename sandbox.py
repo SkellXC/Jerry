@@ -1,71 +1,133 @@
-import cv2
-import mediapipe as mp
-import face_recognition
+import os
+import struct
+import wave
+import math
+import pyaudio
+import numpy as np
+from openwakeword.model import Model
+from faster_whisper import WhisperModel
 
-# 1. Load reference image
-reference_image = face_recognition.load_image_file("my_face.jpg")
-my_face_encoding = face_recognition.face_encodings(reference_image)[0]
+# --- Configuration ---
+WAKE_WORD_MODEL = r"C:\Users\ethan\Jerry\Jerry\Hey_Friday_20260713_201149.onnx"
+WAKE_WORD_MODEL2 = r"C:\Users\ethan\Downloads\Hey_Friday_20260713_201149.onnx"
 
-# 2. Setup MediaPipe Detector
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+# Audio Recording Settings
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 16000  # Required by OpenWakeWord and Whisper
+CHUNK = 1280  # OpenWakeWord processes audio in 80ms chunks (1280 frames)
+SILENCE_THRESHOLD = 500  # Adjust this based on your room's background noise
+SILENCE_DURATION = 1.5   # Seconds of silence required to stop recording
 
-cam = cv2.VideoCapture(0)
+# --- Initialize Local Models ---
+print("Loading Faster-Whisper model...")
+# Your Ryzen 7 5800X handles the 'base' model on CPU instantly
+whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 
-frameWidth = int(cam.get(cv2.CAP_PROP_FRAME_WIDTH))
-frameHeight = int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
+print("Loading OpenWakeWord model...")
+# Downloads/loads the pre-trained 'Hey Jarvis' model locally
+oww_model = Model(wakeword_models=[WAKE_WORD_MODEL2],
+                   inference_framework="onnx")
 
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter('out.mp4', fourcc, 20.0, (frameWidth, frameHeight))
+def is_silent(data_chunk):
+    """Calculates RMS (Root Mean Square) volume to detect silence."""
+    count = len(data_chunk) / 2
+    format_string = f"<{int(count)}h"
+    shorts = struct.unpack(format_string, data_chunk)
+    sum_squares = sum(s**2 for s in shorts)
+    rms = math.sqrt(sum_squares / count)
+    return rms < SILENCE_THRESHOLD
 
-while True:
-    ret, frame = cam.read()
-    if not ret:
-        break
+def record_command(audio_stream):
+    """Records audio until silence is detected."""
+    print("\nListening for command...")
+    frames = []
+    silent_chunks = 0
+    max_silent_chunks = int((RATE / CHUNK) * SILENCE_DURATION)
+    has_spoken = False
 
-    frame = cv2.flip(frame, 1)
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    while True:
+        data = audio_stream.read(CHUNK, exception_on_overflow=False)
+        frames.append(data)
+
+        if is_silent(data):
+            if has_spoken:
+                silent_chunks += 1
+            if silent_chunks > max_silent_chunks:
+                print("Silence detected. Stopping recording.")
+                break
+        else:
+            has_spoken = True
+            silent_chunks = 0  # Reset silence counter when speech is detected
+
+    # Save the buffer to a temporary WAV file for Whisper
+    filename = "temp_command.wav"
+    with wave.open(filename, 'wb') as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(pyaudio.get_sample_size(FORMAT))
+        wf.setframerate(RATE)
+        wf.writeframes(b''.join(frames))
     
-    # 3. Detect faces with MediaPipe
-    results = face_detection.process(rgb_frame)
-    
-    if results.detections:
-        h, w, _ = frame.shape
-        face_locations = []
-        
-        for detection in results.detections:
-            bbox = detection.location_data.relative_bounding_box
-            
-            # Convert MediaPipe's normalized coordinates to dlib's pixel format (top, right, bottom, left)
-            top = max(0, int(bbox.ymin * h))
-            bottom = min(h, int((bbox.ymin + bbox.height) * h))
-            left = max(0, int(bbox.xmin * w))
-            right = min(w, int((bbox.xmin + bbox.width) * w))
-            
-            face_locations.append((top, right, bottom, left))
-            
-        # 4. Extract features using ONLY the bounding boxes found by MediaPipe
-        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
-        
-        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            matches = face_recognition.compare_faces([my_face_encoding], face_encoding)
-            
-            name = "Unknown"
-            color = (0, 0, 255) 
+    return filename
 
-            if matches[0]:
-                name = "Me"
-                color = (0, 255, 0)
+def main():
+    # Set up PyAudio input stream
+    pa = pyaudio.PyAudio()
+    audio_stream = pa.open(
+        rate=RATE,
+        channels=CHANNELS,
+        format=FORMAT,
+        input=True,
+        frames_per_buffer=CHUNK
+    )
+
+    print("\nSystem ready. Say 'Hey Jarvis' to wake me up. Press Ctrl+C to exit.")
+
+    try:
+        while True:
+            # Read exactly the number of frames OpenWakeWord expects
+            pcm = audio_stream.read(CHUNK, exception_on_overflow=False)
+            
+            # Convert raw audio bytes to numpy array for OpenWakeWord
+            audio_data = np.frombuffer(pcm, dtype=np.int16)
+            
+            # Process the audio frame
+            prediction = oww_model.predict(audio_data)
+            
+            # OpenWakeWord returns a dictionary of scores. We grab the highest score.
+            # 0.5 is the default confidence threshold for a positive detection.
+            max_score = max(prediction.values())
+            
+            if max_score > 0.5:
+                print("\nWake word detected!")
                 
-            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-            cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+                # Step 2: Trigger recording loop
+                audio_file = record_command(audio_stream)
+                
+                # Step 3: Transcribe with Faster-Whisper
+                print("Transcribing...")
+                segments, info = whisper_model.transcribe(audio_file, beam_size=5)
+                
+                transcription = "".join([segment.text for segment in segments]).strip()
+                print(f"User command: {transcription}")
+                
+                # Clear the wake word model's internal audio buffer so it doesn't immediately re-trigger
+                oww_model.reset()
+                
+                # Reset for the next command
+                print("\nSystem ready. Say 'Hey Jarvis' to wake me up.")
 
-    out.write(frame)
-    cv2.imshow('Camera', frame)
+    except KeyboardInterrupt:
+        print("\nShutting down Hearing Module...")
+    finally:
+        # Clean up resources
+        if 'audio_stream' in locals():
+            audio_stream.stop_stream()
+            audio_stream.close()
+        if 'pa' in locals():
+            pa.terminate()
+        if os.path.exists("temp_command.wav"):
+            os.remove("temp_command.wav")
 
-    if cv2.waitKey(1) == ord('q'):
-        break
-
-cam.release()
-out.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
